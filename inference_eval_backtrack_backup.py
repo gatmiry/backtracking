@@ -2,7 +2,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 import classifier_lib
 import numpy as np
 
@@ -24,25 +24,25 @@ from tqdm import tqdm
 @dataclass
 class Args:
     benchmark: str = "aime-24"
-    max_samples: int = 16
+    max_samples: int = 2
     seed: int = 1337
     piref_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     output_path: str = "outputs/inference_outputs.jsonl"
     attention_impl: str = "sdpa"
     piref_gpu_util: float = 0.5
     batch_size: int = 1
-    max_length: int = 8192 ##16384
-    block_size: int = 4096 ##4096
+    max_length: int = 4096 ##16384
+    block_size: int = 1024 ##4096
     max_blocks: int = 8
     temperature: float = 0.6
     top_p: float = 0.95
     classifier_ckpt_path: str = "VGS-AI/DeepSeek-VM-1.5B"
     use_rejection_sampling: bool = False
-    max_value_estimate_num_attempts: int = 4
+    max_value_estimate_num_attempts: int = 1
     num_repetitions: int = 1 
     dataset_size: int = -1
     wandb_project: str = "PRM_prediction_AME24_backtrack"
-    gpu_id: int = 7
+    gpu_id: int = 4
 
     def __post_init__(self) -> None:
         output_dir = os.path.dirname(self.output_path)
@@ -229,12 +229,184 @@ def generate_single_line(
     return outputs
 
 
+def estimate_required_memory_gb(args: Args, total_gpu_memory_gb: float) -> float:
+    """
+    Estimate required GPU memory in GB based on args parameters.
+    
+    This estimates memory for:
+    - piref_model (sglang engine): uses piref_gpu_util fraction of GPU memory
+      (this already includes KV cache and internal buffers)
+    - classifier_model: model weights + KV cache + activations
+    - Peak memory during rejection sampling (multiple forward passes)
+    - Buffer for safety
+    
+    Args:
+        args: Configuration arguments
+        total_gpu_memory_gb: Total GPU memory in GB
+        
+    Returns:
+        Estimated required memory in GB
+    """
+    # piref_model memory: uses piref_gpu_util fraction of total GPU memory
+    # Note: sglang's mem_fraction_static already accounts for KV cache and buffers
+    piref_memory_gb = total_gpu_memory_gb * args.piref_gpu_util
+    
+    # classifier_model memory: estimate based on model size
+    # 1.5B model in bfloat16 ≈ 3GB base for weights
+    classifier_base_memory_gb = 3.5  # Model weights + small overhead
+    
+    # KV cache for classifier during forward pass
+    # For transformer models: 2 * num_layers * hidden_size * seq_len * 2 bytes (bfloat16)
+    # For 1.5B model: ~24 layers, 1536 hidden_size
+    # Rough estimate: ~0.4GB per 1000 tokens for KV cache
+    max_seq_length = args.max_length
+    classifier_kv_cache_per_pass_gb = (max_seq_length / 1000) * 0.4
+    
+    # Activation memory during forward pass (intermediate activations)
+    # Rough estimate: ~0.2GB per 1000 tokens for activations
+    classifier_activation_per_pass_gb = (max_seq_length / 1000) * 0.2
+    
+    # Peak memory during rejection sampling: multiple forward passes
+    # Account for max_value_estimate_num_attempts + potential rejection sampling loops
+    # In worst case, we might have multiple classifier forward passes
+    max_concurrent_passes = max(args.max_value_estimate_num_attempts, 2)
+    if args.use_rejection_sampling:
+        max_concurrent_passes = max(max_concurrent_passes, 3)  # Rejection sampling can loop
+    
+    classifier_peak_memory_gb = classifier_base_memory_gb + (classifier_kv_cache_per_pass_gb + classifier_activation_per_pass_gb) * max_concurrent_passes
+    
+    # Safety buffer for PyTorch memory allocator fragmentation and other overhead
+    # Increased buffer to account for memory fragmentation
+    buffer_gb = 4.0
+    
+    total_required_gb = piref_memory_gb + classifier_peak_memory_gb + buffer_gb
+    
+    return total_required_gb
+
+
+def check_gpu_has_sufficient_memory(gpu_id: int, args: Args) -> Tuple[bool, float, float]:
+    """
+    Check if a GPU has sufficient memory for the given args.
+    
+    Args:
+        gpu_id: GPU ID to check
+        args: Configuration arguments
+        
+    Returns:
+        Tuple of (has_sufficient_memory, available_memory_gb, required_memory_gb)
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False, 0.0, 0.0
+        if gpu_id >= torch.cuda.device_count():
+            return False, 0.0, 0.0
+        
+        # Temporarily set CUDA_VISIBLE_DEVICES to check this specific GPU
+        old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        try:
+            # Get available memory on this GPU
+            free_memory, total_memory = torch.cuda.mem_get_info(0)  # Use 0 since CUDA_VISIBLE_DEVICES restricts
+            available_gb = free_memory / (1024**3)
+            total_gb = total_memory / (1024**3)
+            
+            # sglang will try to reserve this much memory (based on total, not available)
+            sglang_reservation_gb = total_gb * args.piref_gpu_util
+            
+            # Estimate classifier memory needs
+            classifier_base_memory_gb = 3.5
+            max_seq_length = args.max_length
+            classifier_kv_cache_per_pass_gb = (max_seq_length / 1000) * 0.4
+            classifier_activation_per_pass_gb = (max_seq_length / 1000) * 0.2
+            max_concurrent_passes = max(args.max_value_estimate_num_attempts, 2)
+            if args.use_rejection_sampling:
+                max_concurrent_passes = max(max_concurrent_passes, 3)
+            classifier_peak_memory_gb = classifier_base_memory_gb + (classifier_kv_cache_per_pass_gb + classifier_activation_per_pass_gb) * max_concurrent_passes
+            
+            # Safety buffer for memory fragmentation, peak usage, and temporary allocations
+            # Increased buffer to account for:
+            # - Memory fragmentation (can reduce effective memory by 10-20%)
+            # - Temporary tensors during generation
+            # - Multiple forward passes during rejection sampling
+            # - PyTorch memory allocator overhead
+            # - Memory spikes during long sequences
+            buffer_gb = 8.0  # Increased buffer to prevent runtime OOM
+            
+            # Required memory calculation:
+            # sglang and classifier share the GPU, but sglang's reservation is a hard limit
+            # We need space for both models plus buffer
+            required_gb = sglang_reservation_gb + classifier_peak_memory_gb + buffer_gb
+            
+            # Additional check: if sglang's reservation alone is close to available, it's risky
+            # sglang might not be able to allocate its full reservation if memory is fragmented
+            # Also check if required exceeds available
+            if sglang_reservation_gb > available_gb * 0.85:  # More conservative: 85% threshold
+                # sglang wants >85% of available - very risky, likely to fail
+                # Mark as insufficient
+                has_sufficient = False
+            elif required_gb > available_gb:
+                has_sufficient = False
+            else:
+                has_sufficient = available_gb >= required_gb
+            
+            return has_sufficient, available_gb, required_gb
+        finally:
+            if old_cuda_visible is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+            elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+    except Exception as e:
+        print(f"Warning: Could not check GPU {gpu_id} memory: {e}")
+        return False, 0.0, 0.0
 
 
 @torch.no_grad()
 def main(args: Args) -> None:
-    # Set CUDA_VISIBLE_DEVICES before importing torch/sglang operations
+
+    import os
+    # Check GPU memory before setting CUDA_VISIBLE_DEVICES
+    has_sufficient, available_gb, required_gb = check_gpu_has_sufficient_memory(args.gpu_id, args)
+    
+    # Add extra safety margin (10% of required memory) to account for memory fragmentation
+    safety_margin_gb = required_gb * 0.1
+    total_required_with_margin = required_gb + safety_margin_gb
+    
+    if available_gb < total_required_with_margin:
+        print(f"ERROR: GPU {args.gpu_id} does not have sufficient memory!")
+        print(f"  Required (base): {required_gb:.2f} GB")
+        print(f"  Required (with safety margin): {total_required_with_margin:.2f} GB")
+        print(f"  Available: {available_gb:.2f} GB")
+        print(f"  Shortage: {total_required_with_margin - available_gb:.2f} GB")
+        print("\nMemory breakdown:")
+        print(f"  - piref_model (sglang): ~{required_gb * 0.4:.2f} GB")
+        print(f"  - classifier_model (peak): ~{required_gb * 0.3:.2f} GB")
+        print(f"  - KV cache & activations: ~{required_gb * 0.2:.2f} GB")
+        print(f"  - Safety buffer: ~{required_gb * 0.1:.2f} GB")
+        print("\nPlease either:")
+        print("  1. Use a GPU with more available memory (set --gpu_id to a different GPU)")
+        print("  2. Reduce piref_gpu_util (currently {})".format(args.piref_gpu_util))
+        print("  3. Reduce max_length (currently {})".format(args.max_length))
+        print("  4. Reduce batch_size (currently {})".format(args.batch_size))
+        print("  5. Reduce max_value_estimate_num_attempts (currently {})".format(args.max_value_estimate_num_attempts))
+        raise RuntimeError(f"GPU {args.gpu_id} has insufficient memory: {available_gb:.2f} GB available, {total_required_with_margin:.2f} GB required (with margin)")
+    
+    margin_gb = available_gb - total_required_with_margin
+    if margin_gb < 5.0:
+        print(f"WARNING: GPU {args.gpu_id} has low memory margin!")
+        print(f"  Required (with margin): {total_required_with_margin:.2f} GB")
+        print(f"  Available: {available_gb:.2f} GB")
+        print(f"  Margin: {margin_gb:.2f} GB (recommended: >5 GB)")
+        print("  Consider reducing memory usage to avoid potential OOM errors.")
+    
+    print(f"GPU {args.gpu_id} memory check passed:")
+    print(f"  Required (base): {required_gb:.2f} GB")
+    print(f"  Required (with margin): {total_required_with_margin:.2f} GB")
+    print(f"  Available: {available_gb:.2f} GB")
+    print(f"  Margin: {margin_gb:.2f} GB")
+    
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     device = 'cuda:0'
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
@@ -435,19 +607,13 @@ def log_to_server(args: Args):
     scores = np.array([d['generated_scores'] for d in data])
     rewards = np.array([d['reward'] for d in data])
     processed_answers = np.array([d['processed_answer'] for d in data])
-    
-    # In backtrack version, rewards is 1D (one reward per sample) and scores is 2D (scores per token)
-    # Use the final classifier score for each sample
-    final_classifier_scores = np.array([scores[i][-1] if len(scores[i]) > 0 else 0.0 for i in range(len(scores))])
-    
-    # Since there's only one generation per sample, bon_rewards is just the rewards
-    # But we can still use classifier_bon with n=1 for consistency
+    num_beams = rewards.shape[1]
     bon_rewards = torch.tensor([
-        eval_helpers.classifier_bon(rewards=[rewards[i]], classifier_values=[final_classifier_scores[i]], n=1)[0]
+        eval_helpers.classifier_bon(rewards=rewards[i], classifier_values=scores[i], n=num_beams)
         for i in range(len(data))
     ]).float()
-    
     # num_repetitions is outer loop
+    
     bon_rewards = bon_rewards.view(args.num_repetitions, args.dataset_size).transpose(0, 1)
     
     for i in range(bon_rewards.shape[0]):

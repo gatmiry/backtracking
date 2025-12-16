@@ -1,4 +1,6 @@
 import os
+# Set CUDA_VISIBLE_DEVICES before importing torch/sglang
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import random
 import time
 from dataclasses import dataclass
@@ -24,25 +26,24 @@ from tqdm import tqdm
 @dataclass
 class Args:
     benchmark: str = "aime-24"
-    max_samples: int = 16
+    max_samples: int = 8
     seed: int = 1337
     piref_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     output_path: str = "outputs/inference_outputs.jsonl"
     attention_impl: str = "sdpa"
-    piref_gpu_util: float = 0.5
+    piref_gpu_util: float = 0.2
     batch_size: int = 1
-    max_length: int = 8192 ##16384
-    block_size: int = 4096 ##4096
+    max_length: int = 4096 ##16384
+    block_size: int = 1024 ##4096
     max_blocks: int = 8
     temperature: float = 0.6
     top_p: float = 0.95
     classifier_ckpt_path: str = "VGS-AI/DeepSeek-VM-1.5B"
     use_rejection_sampling: bool = False
-    max_value_estimate_num_attempts: int = 4
+    max_value_estimate_num_attempts: int = 1
     num_repetitions: int = 1 
     dataset_size: int = -1
     wandb_project: str = "PRM_prediction_AME24_backtrack"
-    gpu_id: int = 7
 
     def __post_init__(self) -> None:
         output_dir = os.path.dirname(self.output_path)
@@ -229,12 +230,8 @@ def generate_single_line(
     return outputs
 
 
-
-
 @torch.no_grad()
 def main(args: Args) -> None:
-    # Set CUDA_VISIBLE_DEVICES before importing torch/sglang operations
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     device = 'cuda:0'
     device_type = "cuda" if torch.cuda.is_available() else "cpu"

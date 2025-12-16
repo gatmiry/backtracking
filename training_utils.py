@@ -31,6 +31,7 @@ class FlattenedDataset(Dataset):
             grouped_keys: A list of keys whose values are lists to be flattened.
             shared_keys: A list of keys whose values are to be shared across the flattened entries.
         """
+        print('Im at the instructor for flattenedDataset')
         assert big_group_size % small_group_size == 0, f"{big_group_size=}, {small_group_size=}"
         self.grouped_dataset = grouped_dataset
         self.grouped_keys = grouped_keys
@@ -40,7 +41,9 @@ class FlattenedDataset(Dataset):
         current_index = 0
         self.group_boundaries = []  # one tuple per row in grouped_dataset
         num_small_groups = len(grouped_dataset) * big_group_size // small_group_size
+        #print(f"num_small_groups: {num_small_groups}")
         for i in tqdm(range(num_small_groups), desc="Flattening dataset"):
+            #print(f"Flattening dataset... {i}/{num_small_groups}")
             # for k in grouped_keys:
             #     assert len(grouped_dataset[i][k]) == num_elems_per_group, f"{i=},{k=}: Expected {num_elems_per_group} elements, got {len(grouped_dataset[i][k])}."
             start = current_index
@@ -80,7 +83,7 @@ class EndlessSampler(Sampler):
         group_boundaries: A list of tuples (start, end) indicating the contiguous range
                           in flattened_dataset.flattened_data for each original row.
     """
-    def __init__(self, flattened_dataset, batch_size, process_rank: int = 0, num_processes: int = 1, shuffle=True, endless=True):
+    def __init__(self, flattened_dataset, batch_size, process_rank: int = 0, num_processes: int = 1, shuffle=True, endless=False):
         """
         Args:
             flattened_dataset: An instance of FlattenedDataset.
@@ -195,6 +198,7 @@ class RollInOutCollator:
                 combined = combined[:self.max_length]
                 roll_out_mask = roll_out_mask[:self.max_length]
 
+            #print(f'length of combined: {len(combined)}')
             batch_input_ids.append(combined)
             batch_roll_out_masks.append(roll_out_mask)
 
@@ -205,6 +209,7 @@ class RollInOutCollator:
 
         # Determine maximum sequence length in the batch for padding.
         max_len = max(len(seq) for seq in batch_input_ids)
+        #print(f'max_len: {max_len}')
         if self.pad_multiple is not None:
             max_len = int(math.ceil(max_len / self.pad_multiple)) * self.pad_multiple
             assert max_len <= self.max_length, f"{max_len=}, {self.max_length=}"

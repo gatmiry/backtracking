@@ -15,12 +15,6 @@ import math
 import numpy as np
 import copy
 import sglang as sgl
-try:
-    import wandb
-    # Set your wandb API key here (optional - you can also use wandb login or WANDB_API_KEY env var)
-    # os.environ["WANDB_API_KEY"] = "your-api-key-here"
-except ImportError:
-    wandb = None
 
 
 def get_token_ids(list_of_token_strs, tokenizer):
@@ -59,14 +53,14 @@ def unflatten_variable_n(xs, ns):
 class Args:
     benchmark: str = "aime-24"
     dataset_size: int = -1  # will be set automatically based on the dataset
-    attention_impl: str = "sdpa"
+    attention_impl: str = "flash_attention_2"
     seed: int = 1337
-    max_samples: int = 8
+    max_samples: int = -1
     piref_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     use_sglang_server: bool = False
     sglang_port: int = 30000
     classifier_ckpt_path: str = "VGS-AI/DeepSeek-VM-1.5B"
-    output_path: str = "./inference_outputs.jsonl"
+    output_path: str = "inference_outputs.jsonl"
     search_type: str = "beam2"
     # fraction of memory to allocate to piref inference engine
     piref_gpu_util: float = 0.5
@@ -77,10 +71,10 @@ class Args:
     num_blocks: int = 8
     temperature: float = 0.6
     top_p: float = 0.95
-    num_repetitions: int = 2  # number of times to repeat the generation for each input
+    num_repetitions: int = 1  # number of times to repeat the generation for each input
 
-    # log to wandb. assumes WANDB_API_KEY is set (or wandb login has been run)
-    wandb_project: str = "PRM_prediction_AME24"
+    # log to neptune. assumes NEPTUNE_API_KEY is set
+    neptune_project: str = "FILL_IN_WITH_YOUR_PROJECT_NAME_HERE"
 
 
     def __post_init__(self):
@@ -184,7 +178,6 @@ def generate_beam(
     """Output all the kept beams for each prompt. The number of kept beams is num_blocks // beam_size.
     Also return the scores for each kept beam.
     """
-    ### the output format of this function is wrong, it is a dict of list of list of list of ints
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     device = 'cuda:0'
     device_type = 'cuda'
@@ -326,28 +319,23 @@ def contiguous_view(nparr, shape):
 
 def get_logger(logger_kwargs):
     print("logger kwargs: ", logger_kwargs)
-    if wandb is None:
-        raise ImportError("wandb is not installed. Please install it with: pip install wandb")
-
-    # Optional: Login programmatically if API key is set in code
-    # This is NOT necessary if you've run 'wandb login' or set WANDB_API_KEY env var
-    # wandb.login(key="your-api-key-here")
+    import neptune_scale
 
     tags = logger_kwargs.pop('tags')
     group_tag = tags.pop("group_tag")
     experiment = logger_kwargs.pop('experiment')
     experiment_name = logger_kwargs.pop('name')
-    
-    print("Starting to log to wandb...")
-    run = wandb.init(
-        project=experiment,
-        name=experiment_name,
-        # Don't use fixed id to avoid conflicts with deleted runs
-        # id=experiment_name,  # commented out to avoid conflicts
-        tags=[group_tag] + [f"{k}:{v}" for k, v in tags.items()],
-        config=tags,
-        resume="allow",  # allow resuming if run exists, or create new if deleted
-    )
+    logger_kwargs.update({
+        # accept either NEPTUNE_API_TOKEN or NEPTUNE_API_KEY
+        'api_token': os.environ.get("NEPTUNE_API_TOKEN") or os.environ.get("NEPTUNE_API_KEY"),
+        'project': experiment,
+        'run_id': experiment_name,
+        'experiment_name': experiment_name,
+    })
+    print("Starting to log to Neptune...")
+    run = neptune_scale.Run(**logger_kwargs)
+    run.add_tags([group_tag], group_tags=True)
+    run.log_configs(tags)
     return run
 
 
@@ -370,11 +358,10 @@ def log_to_server(args: Args):
         "seed": str(args.seed),
         "group_tag": str(tag),
         "dvts_n": str(1),
-        "timestamp": str(time.time()),
     }
     experiment_name = f"{tag}_seed_{args.seed}"
     logger_kwargs = dict(
-        experiment=args.wandb_project,
+        experiment=args.neptune_project,
         name=experiment_name,
         tags=tags,
     )
@@ -391,7 +378,7 @@ def log_to_server(args: Args):
     # num_repetitions is outer loop
     bon_rewards = bon_rewards.view(args.num_repetitions, args.dataset_size).transpose(0, 1)  # repetitions is the outer loop, so need to transpose.
     bon_m, bon_ci = eval_helpers.estimate_mean_and_error(bon_rewards)
-    print(f"bon_m: {bon_m}, bon_ci: {bon_ci}, bon_rewards: {bon_rewards}")
+
     # compute weighted majority vote for each repetition
     if num_beams == 1:
         maj_m, maj_ci = bon_m, bon_ci  # if num_beams == 1, bon and maj are the same
@@ -423,44 +410,19 @@ def log_to_server(args: Args):
     processed_answers_per_prompt = np.ascontiguousarray(processed_answers_per_prompt)  # ensure it's contiguous
 
     print("Logging bon and wmaj metrics...")
-    # Ensure all values are Python floats (not numpy/torch types)
-    metrics_to_log = {
-        f'{args.benchmark}/bon_m': float(bon_m),
-        f'{args.benchmark}/bon_ci': float(bon_ci),
-        f'{args.benchmark}/maj_m': float(maj_m),
-        f'{args.benchmark}/maj_ci': float(maj_ci),
-        f'{args.benchmark}/wmaj_m': float(wmaj_m),
-        f'{args.benchmark}/wmaj_ci': float(wmaj_ci),
-        f'{args.benchmark}/pass_m': float(pass_m),
-        f'{args.benchmark}/pass_ci': float(pass_ci),
-    }
-    print(f"Metrics being logged to wandb: {metrics_to_log}")
-
-    #run.log(metrics_to_log, step=args.num_blocks)
-    for i in range(bon_rewards.shape[0]):
-        print(f'shape[1] of bon_rewards: {bon_rewards.shape[1]}')
-        for j in range(bon_rewards.shape[1]):
-            print(f"Logging bon_rewards_{i}...")
-            run.log({f"{args.benchmark}/bon_rewards_rep_{j}": bon_rewards[i, j].item()}, step=i)
-    #run.log({'rewards': rewards.tolist()})
-    # Log bon_rewards as a line plot: prompt_index on x-axis, one line per repetition
-    
-    
-    #bon_rewards_np = bon_rewards.numpy() if isinstance(bon_rewards, torch.Tensor) else bon_rewards
-    #prompt_indices = list(range(args.dataset_size))
-    #bon_rewards_plot = wandb.plot.line_series(
-    #    xs=prompt_indices,  # Single list of x-axis values (shared across all series)
-    #    ys=[[float(bon_rewards_np[i, j]) for i in range(args.dataset_size)] for j in range(args.num_repetitions)],  # One y-series per repetition
-    #    keys=[f"repetition_{j}" for j in range(args.num_repetitions)],
-    #    title="BON Rewards by Prompt Index",
-    #    xname="Prompt Index"
-    #)
-    ##run.log({f"{args.benchmark}/bon_rewards_by_prompt": bon_rewards_plot})
-    
-    run.finish()
+    run.log_metrics({
+        f'{args.benchmark}/bon_m': bon_m,
+        f'{args.benchmark}/bon_ci': bon_ci,
+        f'{args.benchmark}/maj_m': maj_m,
+        f'{args.benchmark}/maj_ci': maj_ci,
+        f'{args.benchmark}/wmaj_m': wmaj_m,
+        f'{args.benchmark}/wmaj_ci': wmaj_ci,
+        f'{args.benchmark}/pass_m': pass_m,
+        f'{args.benchmark}/pass_ci': pass_ci,
+    }, step=args.num_blocks)
+    run.close()
 
     # now for every power of 2 until num_repetitions, compute the DVTS with weighted majority vote:
-    #you don't enter here because num_repetitions is 1
     if args.num_repetitions > 1:
         for i in range(1, int(math.log2(args.num_repetitions)) + 1):
             dvts_n = 2 ** i
@@ -473,13 +435,13 @@ def log_to_server(args: Args):
                 "group_tag": str(tag),
                 "dvts_n": str(dvts_n),
             }
-            experiment_name = f"{tag}_seed_{args.seed}_dvts_{dvts_n}"
+            experiment_name = f"{tag}_seed_{args.seed}"
             logger_kwargs = dict(
-                experiment=args.wandb_project,
+                experiment=args.neptune_project,
                 name=experiment_name,
                 tags=tags,
             )
-            dvts_run = get_logger(logger_kwargs)
+            run = get_logger(logger_kwargs)
 
             dvts_num_beams = num_beams * dvts_n  # number of beams in the DVTS
             dvts_num_repetitions = args.num_repetitions // dvts_n
@@ -514,19 +476,17 @@ def log_to_server(args: Args):
 
             # log to num_blocks * dvts_n, since that's the compute budget
             print(f"Logging dvts_{dvts_n}...")
-            dvts_metrics_to_log = {
-                f'{args.benchmark}/bon_m': float(dvts_bon_m),
-                f'{args.benchmark}/bon_ci': float(dvts_bon_ci),
-                f'{args.benchmark}/maj_m': float(dvts_maj_m),
-                f'{args.benchmark}/maj_ci': float(dvts_maj_ci),
-                f'{args.benchmark}/wmaj_m': float(dvts_wmaj_m),
-                f'{args.benchmark}/wmaj_ci': float(dvts_wmaj_ci),
-                f'{args.benchmark}/pass_m': float(dvts_pass_m),
-                f'{args.benchmark}/pass_ci': float(dvts_pass_ci),
-            }
-            print(f"DVTS metrics being logged to wandb: {dvts_metrics_to_log}")
-            dvts_run.log(dvts_metrics_to_log, step=args.num_blocks*dvts_n)
-            dvts_run.finish()
+            run.log_metrics({
+                f'{args.benchmark}/bon_m': dvts_bon_m,
+                f'{args.benchmark}/bon_ci': dvts_bon_ci,
+                f'{args.benchmark}/maj_m': dvts_maj_m,
+                f'{args.benchmark}/maj_ci': dvts_maj_ci,
+                f'{args.benchmark}/wmaj_m': dvts_wmaj_m,
+                f'{args.benchmark}/wmaj_ci': dvts_wmaj_ci,
+                f'{args.benchmark}/pass_m': dvts_pass_m,
+                f'{args.benchmark}/pass_ci': dvts_pass_ci,
+            }, step=args.num_blocks*dvts_n)
+            run.close()
 
     print("Finished everything. Bye bye!")
 
@@ -589,12 +549,11 @@ def main(args: Args):
         print(f"Found {n_done} existing samples in {args.output_path}.")
 
         if len(skip_indices) == (args.dataset_size * args.num_repetitions):
-            print(f"Output file {args.output_path} already contains .")
-            if wandb is not None:
-                print('Logging to wandb...')
+            print(f"Output file {args.output_path} already contains all samples.")
+            if os.environ.get("NEPTUNE_API_KEY") or os.environ.get("NEPTUNE_API_TOKEN"):
                 log_to_server(args)
             else:
-                print("wandb not installed; skipping wandb logging.")
+                print("NEPTUNE_API_KEY not set; skipping Neptune logging.")
             exit(0)
         print(f"Already done {skip_indices=}")
     else:
@@ -703,4 +662,39 @@ def main(args: Args):
             generated_ids = unflatten_variable_n(generated_ids, num_generations_per_prompt)
             generated_raw_texts = unflatten_variable_n(generated_raw_texts, num_generations_per_prompt)
             processed_answers = unflatten_variable_n(processed_answers, num_generations_per_prompt)
-            rewards = unflatten_variable_n(rewards, num_generations_
+            rewards = unflatten_variable_n(rewards, num_generations_per_prompt)
+
+        print("Finished calculating rewards. Now writing to output file...")
+        dt = time.time() - batch_t0
+        with open(args.output_path, "a") as f:
+            for i in tqdm(range(cur_batch_size), desc="writing to file", leave=False):
+                outputs = {
+                    "repeat_idx": batch['repeat_idx'][i],
+                    "data_idx": batch['data_idx'][i],
+                    "global_idx": batch["global_idx"][i],
+                    "problem": batch["problem"][i],
+                    "gt_answer": batch["answer"][i],
+                    "generated_ids": generated_ids[i],
+                    "generated_scores": generated_scores[i],
+                    "processed_answer": processed_answers[i],
+                    "reward": rewards[i],
+                    "dt": dt / cur_batch_size,  # average time per sample
+                }
+                f.write(json.dumps(outputs) + "\n")
+                f.flush()
+
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        mean_reward = rewards.mean().item()
+        se_reward = 0 if len(rewards) == 1 else torch.std(rewards, correction=1) / (len(rewards) ** 0.5)
+        print(f"indices={min(global_indices)}-{max(global_indices)} | size={cur_batch_size} | dt={dt/cur_batch_size:.2f}s per elem | reward={mean_reward} ± {se_reward}")
+
+    if os.environ.get("NEPTUNE_API_KEY") or os.environ.get("NEPTUNE_API_TOKEN"):
+        print("Finished all batches. Now logging to neptune...")
+        log_to_server(args)
+    else:
+        print("NEPTUNE_API_KEY not set; skipping Neptune logging.")
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    main(args)

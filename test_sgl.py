@@ -67,9 +67,10 @@ if __name__ == '__main__':
     print(f"Using {tp_size} GPU(s) with tensor parallelism (vocab_size={vocab_size} must be divisible by tp_size)")
     
     engine = sgl.Engine(model_path=model_path, dtype=dtype, device=device, tp_size=tp_size, mem_fraction_static=0.4, random_seed=seed, skip_tokenizer_init=True)
-    max_length = 8192
-    block_size = 1024
-    max_length_without_prm = 8192
+    max_length = 16384
+    block_size = 4096
+    num_blocks = 8
+    max_length_without_prm = 16384
     dataset_top_n = 50
     sampling_params = [{
         'temperature': 0.6, 
@@ -108,9 +109,9 @@ if __name__ == '__main__':
         for i in range(dataset_top_n)
     ]
 
-    max_value_estimate_num_attempts = 3
+    max_value_estimate_num_attempts = 6
     print('eos token id: ', eos_token_id)
-    outputs = generate_backtrack_batch(engine, input_ids, max_length, block_size, 8, 0.6, 0.9, [eos_token_id], max_value_estimate_num_attempts, classifier_model, False)
+    outputs = generate_backtrack_batch(engine, input_ids, max_length, block_size, num_blocks, 0.6, 0.9, [eos_token_id], max_value_estimate_num_attempts, classifier_model, False)
     generated_texts = tokenizer.batch_decode([output['output_ids'] for output in outputs], skip_special_tokens=False)
     generated_solutions = [deepseek_utils.remove_thinking_text(text) for text in generated_texts]
     processed_answers = [accuracy_utils.process_sample(solution) for solution in generated_solutions]
@@ -132,7 +133,7 @@ if __name__ == '__main__':
         }
         records.append(record)
 
-    output_path = 'outputs/test_sgl_blocksize_1024.jsonl'
+    output_path = 'outputs/test_sgl_blocksize_4096_mve_6.jsonl'
     with open(output_path, 'w') as f:
         for record in records:
             f.write(json.dumps(record) + '\n')
@@ -140,7 +141,7 @@ if __name__ == '__main__':
 
     from datasets import Dataset
     processed_dataset = Dataset.from_list(records)
-    processed_dataset.save_to_disk('outputs/test_sgl_processed_blocksize_1024')
+    processed_dataset.save_to_disk('outputs/test_sgl_processed_blocksize_4096_mve_6')
 
     #print(generated_texts[:5])
     #print(processed_answers[:5])

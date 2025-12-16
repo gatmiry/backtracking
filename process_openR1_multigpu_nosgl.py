@@ -367,23 +367,23 @@ def worker_process(
                 
                 # Generate solution using HuggingFace model
                 
-                generated_ids = generate_single_line(
-                    piref_model=piref_model,
-                    tokenizer=tokenizer,
-                    prompt_ids=[input_ids],
-                    max_length=args.max_length,
-                    block_size=args.block_size,
-                    max_blocks=args.max_blocks,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    stop_token_ids=[tokenizer.eos_token_id],
-                    max_value_estimate_num_attempts=args.max_value_estimate_num_attempts,
-                    classifier_model=classifier,
-                    use_rejection_sampling=args.use_rejection_sampling,
-                )
+                #generated_ids = generate_single_line(
+                #    piref_model=piref_model,
+                #    tokenizer=tokenizer,
+                #    prompt_ids=[input_ids],
+                #    max_length=args.max_length,
+                #    block_size=args.block_size,
+                #    max_blocks=args.max_blocks,
+                #    temperature=args.temperature,
+                #    top_p=args.top_p,
+                #    stop_token_ids=[tokenizer.eos_token_id],
+                #    max_value_estimate_num_attempts=args.max_value_estimate_num_attempts,
+                #    classifier_model=classifier,
+                #    use_rejection_sampling=args.use_rejection_sampling,
+                #)
 
                 ## uncomment this line if you want to skip the prm generation and just sample from the base model
-                #generated_ids = piref_model.generate(input_ids=torch.tensor([input_ids]).to(device), max_new_tokens=args.max_length, temperature=args.temperature, top_p=args.top_p, do_sample=True, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id).tolist()
+                generated_ids = piref_model.generate(input_ids=torch.tensor([input_ids]).to(device), max_new_tokens=args.max_length, temperature=args.temperature, top_p=args.top_p, do_sample=True, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id).tolist()
 
 
                 # Decode and process the generated solution
@@ -537,7 +537,7 @@ def main_multigpu(args: Args, num_samples: int = 100, gpu_list: List[int] = None
         pass  # Already set
     
     dataset_path = '/data/datasets/openR1_math_220k'
-    output_path = 'processed_dataset_multigpu_nosgl.jsonl'
+    output_path = 'processed_dataset_multigpu_nosgl_withprm.jsonl'
     
     # Load dataset to get indices
     print(f"Loading dataset from {dataset_path}...")

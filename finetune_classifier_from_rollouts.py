@@ -19,25 +19,27 @@ import deepseek_utils
 import classifier_lib
 import training_utils
 import eval_helpers
-
+from torch.utils.data import Subset
 
 @dataclass
 class Args:
     # Data arguments
     rollout_file: str = "outputs/inference_outputs.jsonl"
-    model_path: str = "VGS-AI/DeepSeek-VM-1.5B"  # Base classifier model to finetune
+    model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"  # Base classifier model to finetune
     output_dir: str = "outputs/finetuned_classifier"
-    
+    dataset_path: str = "/data/datasets/train_dataset"
     # Training arguments
     max_length: int = 8192
-    batch_size: int = 4
-    micro_batch_size: int = 4
+    micro_batch_size: int = 8
     num_epochs: int = 3
     learning_rate: float = 1e-5
     weight_decay: float = 0.1
     grad_norm_clip: float = 1.0
     warmup_steps: int = 100
-    
+    ddp_rank: int = 0
+    ddp_world_size: int = 1
+    subset_size: int = 2
+
     # Model arguments
     attention_impl: str = "sdpa"
     gradient_checkpointing: bool = True
@@ -48,8 +50,9 @@ class Args:
     gpu_id: int = 0
     save_every: int = 500
     eval_every: int = 200
-    num_labels: int = 1  # Binary classification (reward 0 or 1)
-
+    num_labels: int = 3  # Binary classification (reward 0 or 1)
+    data_num_response: int = 56
+    small_group_size: int = 2
 
 def load_rollouts_from_jsonl(file_path: str) -> List[dict]:
     """Load rollouts from a jsonl file."""
@@ -73,60 +76,24 @@ def load_rollouts_from_jsonl(file_path: str) -> List[dict]:
     print(f"Loaded {len(data)} rollouts")
     return data
 
-
-def prepare_dataset(rollouts: List[dict], tokenizer: transformers.PreTrainedTokenizer) -> List[dict]:
+import datasets
+def prepare_dataset(train_dataset: datasets.Dataset, tokenizer: transformers.PreTrainedTokenizer, data_num_response: int = 56, small_group_size: int = 2) -> training_utils.FlattenedDataset:
     """
-    Convert rollouts to the format expected by the training code.
-    
-    Each sample should have:
-    - roll_in_ids: tokenized problem
-    - roll_outs_ids: list of generated token IDs (single element for our case)
-    - labels: list of rewards (single element for our case)
+    Convert train_dataset in the format in  data_path: str = "VGS-AI/OpenR1-VM"
+
+    data_num_response or big group size is the number of rollouts for each roll_in_ids
+    small group size is just a subgrouping of the big group size of the problems. this variable affect the group_boundaries in the flattened dataset.
     """
-    dataset = []
-    
-    print("Preparing dataset...")
-    for rollout in tqdm(rollouts, desc="Processing rollouts"):
-        problem = rollout["problem"]
-        generated_ids = rollout["generated_ids"]
-        reward = rollout["reward"]
-        
-        # Format the problem using the same format as during inference
-        formatted_problem = deepseek_utils.format_roll_in(problem)
-        roll_in_ids = tokenizer(formatted_problem, add_special_tokens=False)["input_ids"]
-        
-        # Convert reward to int (0 or 1)
-        label = 1 if reward else 0
-        
-        # Create sample in the expected format
-        # For single rollout per problem, we use a list with one element
-        # to match the format expected by the collator
-        sample = {
-            "roll_in_ids": roll_in_ids,
-            "roll_outs_ids": [generated_ids],  # List with single element
-            "labels": label,  # Single value (will be converted to tensor by collator)
-        }
-        dataset.append(sample)
-    
-    return dataset
 
+    #print(f'Im at the flattenedDataset instructor')
+    flattened_dataset = training_utils.FlattenedDataset(train_dataset, grouped_keys=['roll_outs_ids', 'labels', 'roll_in_ids'], shared_keys=[], big_group_size=data_num_response, small_group_size=small_group_size)
+    return flattened_dataset
 
-def create_data_loader(dataset: List[dict], tokenizer: transformers.PreTrainedTokenizer, 
-                       batch_size: int, max_length: int, shuffle: bool = True):
+import training_utils
+def create_data_loader(flattened_dataset: torch.utils.data.Dataset, tokenizer: transformers.PreTrainedTokenizer, 
+                       batch_size: int, max_length: int, shuffle: bool = True, ddp_rank: int = 0, ddp_world_size: int = 1):
     """Create a DataLoader from the dataset."""
     # The dataset format matches what FlattenedDataset expects
-    # We need to wrap it to work with the existing infrastructure
-    class SimpleDataset:
-        def __init__(self, data):
-            self.data = data
-        
-        def __len__(self):
-            return len(self.data)
-        
-        def __getitem__(self, idx):
-            return self.data[idx]
-    
-    simple_dataset = SimpleDataset(dataset)
     
     # Create collator
     pad_multiple = max_length // 16 if max_length % 16 == 0 else None
@@ -137,16 +104,9 @@ def create_data_loader(dataset: List[dict], tokenizer: transformers.PreTrainedTo
         max_length=max_length,
         pad_multiple=pad_multiple
     )
-    
-    # Create DataLoader
-    data_loader = torch.utils.data.DataLoader(
-        simple_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        pin_memory=True,
-        num_workers=2
-    )
+    collate_fn = training_utils.RollInOutCollator(tokenizer, roll_in_key='roll_in_ids', roll_out_key='roll_outs_ids', max_length=max_length, pad_multiple=pad_multiple)
+    train_sampler = training_utils.EndlessSampler(flattened_dataset, batch_size=batch_size, process_rank=ddp_rank, num_processes=ddp_world_size, shuffle=shuffle)
+    data_loader = torch.utils.data.DataLoader(flattened_dataset, batch_sampler=train_sampler, collate_fn=collate_fn, pin_memory=True, num_workers=4, prefetch_factor=8)
     
     return data_loader
 
@@ -251,7 +211,7 @@ def main(args: Args):
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device_type == "cuda" else torch.float32
     
-    torch.set_float32_matmul_precision("high")
+    #torch.set_float32_matmul_precision("high")
     torch.manual_seed(args.seed)
     
     # Create output directory
@@ -264,24 +224,38 @@ def main(args: Args):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # Load rollouts
-    rollouts = load_rollouts_from_jsonl(args.rollout_file)
-    
+    #rollouts = load_rollouts_from_jsonl(args.rollout_file)
+    print(f"Loading dataset from {args.dataset_path}...")
+    raw_dataset = datasets.load_from_disk(args.dataset_path)
+    print(f"finished loading dataset from {args.dataset_path}")
+
     # Prepare dataset
-    dataset = prepare_dataset(rollouts, tokenizer)
-    
+    subset_size = min(args.subset_size, len(raw_dataset))
+    raw_dataset = raw_dataset.select(range(subset_size))
+    print(f"selected {subset_size} rows from the dataset")
+    split_idx = int(len(raw_dataset) * 0.8)
+    print(f"Splitting dataset into train and val...")
+    train_dataset = prepare_dataset(raw_dataset.select(range(split_idx)), tokenizer, data_num_response=args.data_num_response, small_group_size=args.small_group_size)
+    val_dataset = prepare_dataset(raw_dataset.select(range(split_idx, len(raw_dataset))), tokenizer, data_num_response=args.data_num_response, small_group_size=args.small_group_size)
+    print(f"finished splitting dataset into train and val")
+
+    ##this is a torch.utils.data dataset, make sure it has len attribute 
     # Split into train/val (80/20)
-    split_idx = int(len(dataset) * 0.8)
-    train_dataset = dataset[:split_idx]
-    val_dataset = dataset[split_idx:]
+    #val_dataset = Subset(dataset, range(split_idx, len(dataset)))
     
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
     # Create data loaders
+    print(f"Creating data loader with micro_batch_size={args.micro_batch_size}, ddp_world_size={args.ddp_world_size}")
     train_loader = create_data_loader(
-        train_dataset, tokenizer, args.micro_batch_size, args.max_length, shuffle=True
+        train_dataset, tokenizer, args.micro_batch_size, args.max_length, shuffle=True, ddp_rank=args.ddp_rank, ddp_world_size=args.ddp_world_size
     )
+
+    num_batches = len(train_loader)
+    print(f"Number of batches: {num_batches}, Dataset length: {len(train_dataset)}, Batch size: {args.micro_batch_size}, Expected batches: {len(train_dataset) // (args.micro_batch_size * args.ddp_world_size)}")
+    print(f"num training batches: {num_batches}")
     val_loader = create_data_loader(
-        val_dataset, tokenizer, args.micro_batch_size, args.max_length, shuffle=False
+        val_dataset, tokenizer, args.micro_batch_size, args.max_length, shuffle=False, ddp_rank=args.ddp_rank, ddp_world_size=args.ddp_world_size
     )
     
     # Load model
@@ -313,6 +287,7 @@ def main(args: Args):
     
     # Learning rate scheduler
     num_training_steps = len(train_loader) * args.num_epochs
+    print(f"num_training_steps: {num_training_steps}")
     scheduler = transformers.get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -329,7 +304,12 @@ def main(args: Args):
         model.train()
         
         epoch_loss = 0.0
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Training epoch {epoch + 1}")):
+        #batches_per_epoch = len(train_loader)
+        for batch_idx, batch in enumerate(train_loader):
+            #if batch_idx >= batches_per_epoch:
+            #    break
+            batch = {k: v.to(device) for k, v in batch.items()}#batch =batch.to(device)
+            print(f"Training batch {batch_idx} model device {model.device} batch device {batch['input_ids'].device}")
             loss = train_step(model, batch, optimizer, device, dtype)
             epoch_loss += loss
             global_step += 1
