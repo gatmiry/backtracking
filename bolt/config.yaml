@@ -1,0 +1,15 @@
+name: 'Simple test task'
+description: 'Task that sends live logs and user metrics'
+tags: ['bolt-samples']
+setup_command: 'bash setup.sh'
+command: 'python run.py'
+# permissions:
+#   owners: '<OD group or user>'
+#   viewers: '<OD group or user>'
+parameters:
+  learning_rate: 0.1
+  random_seed: 123
+resources:
+  # LATER: this docker image is only needed temporarily until Bolt updates the default to be this one
+  docker_image: docker.apple.com/ml-compute/bolt:latest
+  task_type: 1cpu
