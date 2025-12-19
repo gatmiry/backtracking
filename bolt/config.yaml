@@ -9,7 +9,12 @@ command: 'python run.py'
 parameters:
   learning_rate: 0.1
   random_seed: 123
+  
+
 resources:
   # LATER: this docker image is only needed temporarily until Bolt updates the default to be this one
-  docker_image: docker.apple.com/ml-compute/bolt:latest
-  task_type: 1cpu
+  docker_image: docker.apple.com/ml-compute/bolt:python3.10.11-ubuntu22.04
+  cluster: aws_4
+  #instance_type: p5.48xlarge
+  task_type: 8gpu
+  

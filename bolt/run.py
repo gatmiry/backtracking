@@ -2,6 +2,7 @@ import os
 import random
 import time
 
+from src.test_sgl import create_base_and_backtrack_generations
 # The names package was made available by installing it in the setup command.
 #import names
 
@@ -22,6 +23,7 @@ bolt.set_status_message("Starting")
 
 messages = []
 results = []
+print('device count is ', torch.cuda.device_count())
 for i in range(1, 20):
     time.sleep(5)
     message = 'Iteration %s' % str(i)
@@ -42,6 +44,9 @@ for i in range(1, 20):
     })
 
     mymodel = AutoModel.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+
+create_base_and_backtrack_generations()
+
 
 # All files written to the artifacts directory are persisted synced to Blobby.
 # They are accessible after task completion by all members of the task
