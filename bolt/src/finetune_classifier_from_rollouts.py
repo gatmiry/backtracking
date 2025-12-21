@@ -27,7 +27,7 @@ class Args:
     rollout_file: str = "outputs/inference_outputs.jsonl"
     model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"  # Base classifier model to finetune
     output_dir: str = "outputs/finetuned_classifier"
-    dataset_path: str = "/data/datasets/train_dataset"
+    dataset_path: str = "open-r1/OpenR1-Math-220k" #"/data/datasets/train_dataset"
     # Training arguments
     max_length: int = 8192
     micro_batch_size: int = 8
@@ -38,7 +38,7 @@ class Args:
     warmup_steps: int = 100
     ddp_rank: int = 0
     ddp_world_size: int = 1
-    subset_size: int = 2
+    subset_size: int = 20
 
     # Model arguments
     attention_impl: str = "sdpa"
@@ -226,7 +226,8 @@ def main(args: Args):
     # Load rollouts
     #rollouts = load_rollouts_from_jsonl(args.rollout_file)
     print(f"Loading dataset from {args.dataset_path}...")
-    raw_dataset = datasets.load_from_disk(args.dataset_path)
+    #raw_dataset = datasets.load_from_disk(args.dataset_path)
+    raw_dataset = datasets.load_dataset(args.dataset_path, split="train")
     print(f"finished loading dataset from {args.dataset_path}")
 
     # Prepare dataset
