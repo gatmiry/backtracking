@@ -27,7 +27,7 @@ class Args:
     rollout_file: str = "outputs/inference_outputs.jsonl"
     model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"  # Base classifier model to finetune
     output_dir: str = "outputs/finetuned_classifier"
-    dataset_path: str = "open-r1/OpenR1-Math-220k" #"/data/datasets/train_dataset"
+    dataset_path: str = "VGS-AI/OpenR1-VM" #"open-r1/OpenR1-Math-220k" #"/data/datasets/train_dataset"
     # Training arguments
     max_length: int = 8192
     micro_batch_size: int = 8
@@ -38,7 +38,7 @@ class Args:
     warmup_steps: int = 100
     ddp_rank: int = 0
     ddp_world_size: int = 1
-    subset_size: int = 20
+    subset_size: int = -1
 
     # Model arguments
     attention_impl: str = "sdpa"
@@ -84,6 +84,21 @@ def prepare_dataset(train_dataset: datasets.Dataset, tokenizer: transformers.Pre
     data_num_response or big group size is the number of rollouts for each roll_in_ids
     small group size is just a subgrouping of the big group size of the problems. this variable affect the group_boundaries in the flattened dataset.
     """
+    
+    # Check if dataset has required keys
+    required_keys = ['roll_outs_ids', 'labels', 'roll_in_ids']
+    if len(train_dataset) > 0:
+        sample = train_dataset[0]
+        available_keys = list(sample.keys())
+        missing_keys = [k for k in required_keys if k not in available_keys]
+        
+        if missing_keys:
+            raise KeyError(
+                f"Dataset is missing required keys: {missing_keys}. "
+                f"Available keys: {available_keys}. "
+                f"The dataset should be in the format from 'VGS-AI/OpenR1-VM' with keys: {required_keys}. "
+                f"Please use a preprocessed dataset or add a transformation step to create these keys."
+            )
 
     #print(f'Im at the flattenedDataset instructor')
     flattened_dataset = training_utils.FlattenedDataset(train_dataset, grouped_keys=['roll_outs_ids', 'labels', 'roll_in_ids'], shared_keys=[], big_group_size=data_num_response, small_group_size=small_group_size)
@@ -231,7 +246,7 @@ def main(args: Args):
     print(f"finished loading dataset from {args.dataset_path}")
 
     # Prepare dataset
-    subset_size = min(args.subset_size, len(raw_dataset))
+    subset_size = len(raw_dataset) if args.subset_size == -1 else min(args.subset_size, len(raw_dataset))
     raw_dataset = raw_dataset.select(range(subset_size))
     print(f"selected {subset_size} rows from the dataset")
     split_idx = int(len(raw_dataset) * 0.8)
