@@ -34,6 +34,9 @@ def create_base_and_backtrack_generations():
     seed = 1338
     model_path = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
     
+    # Number of generations per problem
+    n_var = 3  # You can change this value
+    
     # IMPORTANT: Get total GPU count BEFORE setting CUDA_VISIBLE_DEVICES
     total_available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     
@@ -87,7 +90,7 @@ def create_base_and_backtrack_generations():
     # 0.25 = 25% of GPU memory for sglang, leaving 75% for classifier and other operations
     engine = sgl.Engine(model_path=model_path, dtype=dtype, device=device, tp_size=tp_size, mem_fraction_static=0.25, random_seed=seed, skip_tokenizer_init=True)
     max_length = 12288
-    block_size = 1024
+    block_size = 2048
     num_blocks = 8
     max_length_without_prm = 12288
     dataset_top_n = 800
@@ -139,18 +142,42 @@ def create_base_and_backtrack_generations():
     #outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
     classifier_model = classifier_lib.Qwen2ForClassifier.from_pretrained("VGS-AI/DeepSeek-VM-1.5B").to(classifier_device)
     
-    ## generating without the prm
-    base_model_outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
-    base_generated_tokens = [output['output_ids'] for output in base_model_outputs]
-    base_generated_texts = tokenizer.batch_decode(base_generated_tokens, skip_special_tokens=False)
-    base_generated_solutions = [deepseek_utils.remove_thinking_text(text) for text in base_generated_texts]
-    base_processed_answers = [accuracy_utils.process_sample(solution) for solution in base_generated_solutions]
-    base_rewards = [
-        accuracy_utils.math_verify_check(answers[i], base_processed_answers[i])
-        for i in range(dataset_top_n)
-    ]
+    ## generating without the prm - now generate n_var times for each problem
+    print(f"Generating {n_var} times for each problem...")
+    
+    # Initialize lists to store all generations
+    base_processed_answers = [[] for _ in range(dataset_top_n)]  # List of lists, one per problem
+    base_rewards = [[] for _ in range(dataset_top_n)]  # List of lists, one per problem
+    base_generated_solutions_all = [[] for _ in range(dataset_top_n)]  # List of lists, one per problem
+    
+    # Generate n_var times for each problem
+    for gen_idx in range(n_var):
+        print(f"Generation {gen_idx + 1}/{n_var}...")
+        base_model_outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        base_generated_tokens = [output['output_ids'] for output in base_model_outputs]
+        base_generated_texts = tokenizer.batch_decode(base_generated_tokens, skip_special_tokens=False)
+        base_generated_solutions = [deepseek_utils.remove_thinking_text(text) for text in base_generated_texts]
+        base_processed_answers_batch = [accuracy_utils.process_sample(solution) for solution in base_generated_solutions]
+        
+        # Store the processed answers, rewards, and generated solutions for this generation
+        for i in range(dataset_top_n):
+            base_processed_answers[i].append(base_processed_answers_batch[i])
+            reward = accuracy_utils.math_verify_check(answers[i], base_processed_answers_batch[i])
+            base_rewards[i].append(reward)
+            base_generated_solutions_all[i].append(base_generated_solutions[i])
 
-    max_value_estimate_num_attempts = 6
+    # Compute best-of-i rewards for each problem
+    # For each problem, compute whether the best of first i generations is correct
+    # (i.e., if any of the first i generations is correct)
+    reward_with_best_of = {}
+    for i in range(1, n_var + 1):
+        reward_with_best_of[i] = []
+        for problem_idx in range(dataset_top_n):
+            # Check if any of the first i generations is correct
+            best_of_i = any(base_rewards[problem_idx][:i])
+            reward_with_best_of[i].append(best_of_i)
+
+    max_value_estimate_num_attempts = n_var
     print('eos token id: ', eos_token_id)
     outputs = generate_backtrack_batch(engine, input_ids, max_length, block_size, num_blocks, 0.6, 0.9, [eos_token_id], max_value_estimate_num_attempts, classifier_model, False)
     generated_texts = tokenizer.batch_decode([output['output_ids'] for output in outputs], skip_special_tokens=False)
@@ -160,6 +187,7 @@ def create_base_and_backtrack_generations():
         accuracy_utils.math_verify_check(ground_truth, processed)
         for ground_truth, processed in zip(answers, processed_answers)
     ]
+    total_attempts_list = [output['total_attempts'] for output in outputs]
 
     records = []
     for i in range(len(problems)):
@@ -167,14 +195,18 @@ def create_base_and_backtrack_generations():
             "problem": problems[i],
             "processed_answer": processed_answers[i],
             "reward": rewards[i],
-            "processed_answer_without_prm": base_processed_answers[i],
-            "reward_without_prm": base_rewards[i],
+            "processed_answer_without_prm": base_processed_answers[i],  # Now an array
+            "reward_without_prm": base_rewards[i],  # Now an array
             "generate_solution": generated_solutions[i],
-            "generated_solution_without_prm": base_generated_solutions[i],
+            "generated_solution_without_prm": base_generated_solutions_all[i],  # Now an array
+            "total_attempts": total_attempts_list[i],  # Total attempts for this problem
         }
+        # Add best-of-i rewards for each i from 1 to n_var
+        for j in range(1, n_var + 1):
+            record[f"reward_with_best_of_{j}"] = reward_with_best_of[j][i]
         records.append(record)
 
-    output_path = 'outputs/test_sgl_blocksize_1024_mve_6_maxlength_12288.jsonl'
+    output_path = 'outputs/test_sgl_best_blocksize_2048_mve_6_maxlength_12288.jsonl'
     with open(output_path, 'w') as f:
         for record in records:
             f.write(json.dumps(record) + '\n')
@@ -182,12 +214,13 @@ def create_base_and_backtrack_generations():
 
     from datasets import Dataset
     processed_dataset = Dataset.from_list(records)
-    processed_dataset.save_to_disk('outputs/test_sgl_processed_blocksize_1024_12288_mve_6')
+    processed_dataset.save_to_disk('outputs/test_sgl_best_processed_blocksize_2048_12288_mve_6')
 
     #print(generated_texts[:5])
     #print(processed_answers[:5])
     #print(rewards[:5])
 
 if __name__ == '__main__':
-    print('im in test_sgl.py')
+    print('im in test_sgl_best.py')
     create_base_and_backtrack_generations()
+
