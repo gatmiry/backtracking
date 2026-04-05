@@ -278,8 +278,8 @@ def main():
             print("  No SFT examples — skipping fine-tuning this round.")
 
         # ── 6. Update PRM calibrator ─────────────────────────────────────
-        print("Updating PRM calibrator...")
-        update_calibrator(calibrator, train_results)
+        # print("Updating PRM calibrator...")
+        # update_calibrator(calibrator, train_results)
 
         # ── 7. Log ───────────────────────────────────────────────────────
         record = {
