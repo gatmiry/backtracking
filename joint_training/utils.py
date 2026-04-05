@@ -76,7 +76,7 @@ def score_trajectory(prm, prm_tokenizer, question: str, answer: str,
     return step_rewards
  
   
-def load_math500(n_train: int = 100, seed: int = 42):
+def load_math500(n_train: int = 400, seed: int = 42):
 
     ds = hf_load_dataset("HuggingFaceH4/MATH-500", split="test")
     rng = np.random.RandomState(seed)
